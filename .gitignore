@@ -1,0 +1,54 @@
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pkl
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# NLP / ML model files
+backend/nlp/models/
+
+# Node.js
+node_modules/
+frontend/node_modules/
+
+# Frontend build files
+dist/
+frontend/dist/
+build/
+
+# Logs
+*.log
+output.log
+pipeline_output.txt
+
+# Backups
+backups/
+*_backup*
+backup_*.py
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Internal/generated files
+all_code.txt
+filelist.txt
+migration_stats.json

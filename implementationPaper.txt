@@ -1,0 +1,1307 @@
+================================================================================
+  MEDISCOPE v2 — TECHNICAL IMPLEMENTATION KNOWLEDGE BASE
+  Extracted from static analysis of the full codebase (backend/ + frontend/)
+  Generated: 2026-06-21
+================================================================================
+
+
+================================================================================
+1. SYSTEM OVERVIEW
+================================================================================
+
+Mediscope is an NLP-powered disease outbreak surveillance dashboard designed for
+public health researchers and analysts. The system:
+
+  1. Ingests news articles from WHO and CDC RSS feeds via Scrapy spiders.
+  2. Fetches real case-count data from the WHO Global Health Observatory (GHO)
+     API and the disease.sh COVID-19 API.
+  3. Classifies articles as outbreak-relevant using a TF-IDF / Logistic
+     Regression classifier (with keyword fallback).
+  4. Extracts disease names and geographic locations using spaCy NER
+     (en_core_web_sm), PhraseMatcher, EntityRuler, regex, and substring
+     fallback layers.
+  5. Enriches extracted outbreaks with case counts from a pre-fetched
+     disease_stats collection (sourced from WHO GHO).
+  6. Stores all data in MongoDB Atlas (collections: raw_articles,
+     processed_articles, diseases, outbreaks, subscribers, disease_stats,
+     alerts_log).
+  7. Serves processed data through a Flask REST API.
+  8. Displays results on a React + Vite frontend with an interactive Leaflet
+     map, Chart.js trend visualizations, disease comparison tables, symptom
+     search, and email alert subscription.
+
+The system is intended to run on a 6-hour crawl cycle (configurable via the
+scheduler module), with the WHO GHO spider running every 24 hours.
+
+
+================================================================================
+2. ARCHITECTURE — TEXT-BASED DATA FLOW DIAGRAM
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            DATA SOURCES                                      │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌────────────────┐               │
+│  │ WHO RSS Feed     │  │ CDC RSS Feed     │  │ disease.sh API │               │
+│  │ (news-english)   │  │ (media/316422)   │  │ (COVID-19)     │               │
+│  └────────┬────────┘  └────────┬─────────┘  └───────┬────────┘               │
+│           │                    │                     │                        │
+│  ┌────────▼────────┐  ┌───────▼──────────┐  ┌───────▼────────┐               │
+│  │ WHOHealthSpider  │  │ CDCHealthSpider  │  │DiseaseAPISpider│               │
+│  │ (Scrapy)         │  │ (Scrapy)         │  │ (requests)     │               │
+│  └────────┬────────┘  └───────┬──────────┘  └───────┬────────┘               │
+│           │                    │                     │                        │
+│           └────────────┬───────┘                     │                        │
+│                        ▼                             ▼                        │
+│              ┌─────────────────┐           ┌─────────────────┐               │
+│              │ raw_articles    │           │ outbreaks        │               │
+│              │ (MongoDB)       │           │ (MongoDB, direct)│               │
+│              └────────┬────────┘           └─────────────────┘               │
+│                       │                                                      │
+│  ┌────────────────────▼───────────────────────────────┐                      │
+│  │              PIPELINE (processor.py)                │                      │
+│  │                                                     │                      │
+│  │  For each raw_article:                              │                      │
+│  │    1. Build analysis text (title + content)         │                      │
+│  │    2. NER extraction → diseases[], locations[]      │                      │
+│  │       (ner.py: PhraseMatcher + substring fallback)  │                      │
+│  │    3. Relevance classification (relevance.py)       │                      │
+│  │       (TF-IDF + LogReg model, OR keyword fallback)  │                      │
+│  │    4. If relevant:                                  │                      │
+│  │       a. Pick primary disease (multi-layer matching)│                      │
+│  │       b. Pick primary country (NER + normalization) │                      │
+│  │       c. Extract case count (regex patterns)        │                      │
+│  │       d. Enrich case count from disease_stats (GHO) │                      │
+│  │       e. Calculate severity                         │                      │
+│  │       f. Upsert to outbreaks collection             │                      │
+│  │    5. Update raw_article with processed=True        │                      │
+│  └─────────────────────┬──────────────────────────────┘                      │
+│                        │                                                     │
+│  ┌─────────────────────▼──────────────────────────────┐                      │
+│  │                WHO GHO ENRICHMENT                   │                      │
+│  │  WHOGHOSpider (runs separately, every 24h)          │                      │
+│  │  → Fetches indicator data for 7 diseases            │                      │
+│  │  → Stores in disease_stats collection               │                      │
+│  │  → enricher.py looks up case counts at pipeline time│                      │
+│  └────────────────────────────────────────────────────┘                      │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────┐                      │
+│  │              ALERT SYSTEM (alerts.py)               │                      │
+│  │  Checks outbreaks → matches subscribers by region   │                      │
+│  │  → Sends email via SendGrid (currently simulated)   │                      │
+│  │  → Logs sent alerts in alerts_log collection        │                      │
+│  └────────────────────────────────────────────────────┘                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                            SERVING LAYER                                     │
+│  ┌──────────────────────┐       ┌─────────────────────────────┐              │
+│  │  Flask REST API       │ ←──→ │  MongoDB Atlas              │              │
+│  │  (app.py + routes.py) │       │  (outbreaks, diseases,      │              │
+│  │  Port 5000            │       │   subscribers, disease_stats)│              │
+│  └──────────┬───────────┘       └─────────────────────────────┘              │
+│             │                                                                │
+│             │  HTTP/JSON (CORS: localhost:5173)                               │
+│             ▼                                                                │
+│  ┌──────────────────────────────────────────────┐                            │
+│  │  React Frontend (Vite, port 5173)             │                            │
+│  │  ├── Home        → /api/outbreaks/summary     │                            │
+│  │  ├── Map         → /api/outbreaks/map         │                            │
+│  │  │                  /api/outbreaks/trends      │                            │
+│  │  ├── DiseaseDetail → /api/diseases/<name>     │                            │
+│  │  ├── Compare     → /api/compare?d1=X&d2=Y    │                            │
+│  │  ├── Search      → /api/search?symptoms=X    │                            │
+│  │  └── Alerts      → /api/alerts/subscribe      │                            │
+│  └──────────────────────────────────────────────┘                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+3. TECHNOLOGY STACK (with justification inferred from usage)
+================================================================================
+
+BACKEND:
+  Language:           Python 3.13
+  Web Framework:      Flask (lightweight, sufficient for a REST API with ~10 endpoints)
+  CORS:               flask-cors (enables frontend on port 5173 to call API on 5000)
+  Web Scraping:       Scrapy (robust RSS/XML parsing via XPath selectors)
+                      requests (simpler HTTP calls for REST APIs: disease.sh, WHO GHO)
+  NLP:                spaCy (en_core_web_sm) — NER for GPE (locations), PhraseMatcher
+                        and EntityRuler for disease name extraction
+                      scikit-learn — TF-IDF vectorization + Logistic Regression for
+                        relevance classification
+                      joblib — model serialization (.pkl files)
+  Database:           pymongo (driver for MongoDB Atlas)
+  Email:              sendgrid (email alert dispatch — currently simulated/commented out)
+  Scheduling:         schedule (Python-native cron-like job scheduler)
+  Configuration:      python-dotenv (loads .env file into os.environ)
+
+FRONTEND:
+  Framework:          React 19.2.4 (component-based UI)
+  Build Tool:         Vite 8.0.1 (fast HMR dev server, ES module bundling)
+  Routing:            react-router-dom 7.13.2 (client-side routing: BrowserRouter)
+  Styling:            TailwindCSS 3.4.19 (utility-first CSS framework)
+                      PostCSS + autoprefixer (build pipeline for Tailwind)
+  HTTP Client:        axios 1.14.0 (promise-based HTTP client with interceptors)
+  Map:                Leaflet 1.9.4 + react-leaflet 5.0.0 (interactive map with
+                        CircleMarker for outbreak locations)
+  Charts:             Chart.js 4.5.1 + react-chartjs-2 5.3.1 (Line chart for
+                        disease trend visualization)
+  Tile Provider:      OpenStreetMap (free, no API key required)
+  Linting:            ESLint 9 with react-hooks and react-refresh plugins
+  Type Hints:         @types/react, @types/react-dom (dev dependency, for IDE support)
+
+
+================================================================================
+4. MODULE-BY-MODULE BREAKDOWN — BACKEND
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1  backend/app.py
+--------------------------------------------------------------------------------
+Purpose: Flask application entry point. Creates the Flask app, configures CORS
+  to allow requests from localhost:5173, forces a DB connection at startup via
+  get_db(), and registers all API routes.
+Key Functions:
+  - Creates Flask(__name__) instance
+  - CORS(app, origins=["http://localhost:5173"])
+  - app.url_map.strict_slashes = False (allows both /path and /path/)
+  - Calls register_routes(app) from api/routes.py
+  - Runs on default Flask port 5000 with debug=True
+External Libraries: Flask, flask-cors
+Design Pattern: Application factory-adjacent (routes registered via function call)
+
+--------------------------------------------------------------------------------
+4.2  backend/config.py
+--------------------------------------------------------------------------------
+Purpose: Loads environment variables from .env file using python-dotenv and
+  exposes them as module-level constants.
+Variables Exposed:
+  - MONGODB_URI: str (from os.getenv)
+  - SENDGRID_API_KEY: str (from os.getenv)
+  - DATABASE_NAME: str = "mediscope" (HARDCODED, not from env despite .env
+    containing DATABASE_NAME key — this is a discrepancy)
+External Libraries: python-dotenv
+
+--------------------------------------------------------------------------------
+4.3  backend/api/routes.py  (449 lines)
+--------------------------------------------------------------------------------
+Purpose: Defines all REST API endpoints via a register_routes(app) function
+  that attaches route handlers to the Flask app instance.
+
+Helper Functions:
+  - _response(success, data, message, status): Standardized JSON envelope
+    returning {"success": bool, "data": any, "message": str}
+  - _handle_errors(route_function): Decorator that catches all exceptions and
+    returns a 500 _response with the error message
+  - _serialize_value(value): Recursively converts datetime → ISO string,
+    ObjectId → str, for JSON serialization
+  - _serialize_document(document): Applies _serialize_value to all fields
+    of a MongoDB document, excluding _id
+  - _is_valid_coordinate_pair(lat, lng): Validates lat/lng ranges
+  - _build_map_outbreak(document, severity): Constructs a map-ready outbreak
+    dict with disease, country, lat, lng, case_count, severity, date, source;
+    returns None if disease is unknown/missing or coordinates invalid
+  - _parse_date(date_string): Parses ISO date strings, handles Z suffix
+  - _build_outbreak_query(args): Constructs MongoDB query from query params
+    (region, disease, date_from, date_to)
+  - _fetch_disease_by_name(name): Case-insensitive regex lookup in diseases
+    collection
+  - _resolve_outbreak_severity(disease_name): Aggregates outbreaks by disease
+    to compute total_cases and occurrences, then calls calculate_severity()
+    from utils/severity.py
+
+Endpoints: (see Section 6 for full reference)
+  GET  /api/health
+  GET  /api/diseases
+  GET  /api/diseases/<name>
+  GET  /api/outbreaks
+  GET  /api/outbreaks/summary
+  GET  /api/outbreaks/map
+  GET  /api/outbreaks/trends
+  GET  /api/search
+  GET  /api/compare
+  GET  /api/export/csv
+  POST /api/alerts/subscribe
+
+External Libraries: Flask, bson (ObjectId), csv, io, re
+Design Pattern: Functional route registration (not Blueprint-based). All routes
+  share a common error-handling decorator and response envelope.
+
+Note: There is NO authentication or authorization on any endpoint.
+
+--------------------------------------------------------------------------------
+4.4  backend/crawler/__init__.py
+--------------------------------------------------------------------------------
+Purpose: Orchestrates all crawlers. Defines SCRAPY_SETTINGS and provides
+  run_all_crawlers() which:
+  1. Calls initialize_database() to ensure collections + indexes exist
+  2. Runs WHOHealthSpider via subprocess (workaround for Twisted reactor
+     not being restartable in-process)
+  3. Runs CDCHealthSpider via subprocess
+  4. Runs DiseaseAPISpider.run() in-process (not Scrapy, just requests)
+
+Key Design Decisions:
+  - Scrapy spiders are run as subprocesses to avoid Twisted reactor conflicts
+  - SCRAPY_SETTINGS: LOG_LEVEL=ERROR, uses SelectReactor
+  - DiseaseAPISpider is the only non-Scrapy crawler
+
+--------------------------------------------------------------------------------
+4.5  backend/crawler/spiders/who_spider.py
+--------------------------------------------------------------------------------
+Purpose: Scrapy spider that fetches the WHO English news RSS feed and stores
+  each article in the raw_articles MongoDB collection.
+Target Source: https://www.who.int/rss-feeds/news-english.xml
+Scraping Method: XPath selectors on RSS XML (<item> elements)
+Fields Extracted Per Article:
+  - source: "WHO" (hardcoded)
+  - credibility: "verified" (hardcoded)
+  - title: from <title> element
+  - content: from <description> element
+  - url: from <link> element (used as unique key)
+  - crawled_at: current UTC timestamp
+  - processed: False (initial state)
+Rate Limiting: None implemented (relies on Scrapy defaults)
+Error Handling:
+  - Skips articles with empty URL
+  - Catches DuplicateKeyError (unique index on url) — silently skips
+  - Catches generic exceptions — prints error, continues
+  - Reports total scraped count on spider close
+
+--------------------------------------------------------------------------------
+4.6  backend/crawler/spiders/cdc_spider.py
+--------------------------------------------------------------------------------
+Purpose: Scrapy spider that fetches the CDC RSS feed and stores articles in
+  raw_articles. Nearly identical structure to who_spider.py.
+Target Source: https://tools.cdc.gov/api/v2/resources/media/316422.rss
+Fields Extracted: Same as WHO spider, but source = "CDC"
+Error Handling: Same pattern as WHO spider
+
+--------------------------------------------------------------------------------
+4.7  backend/crawler/spiders/disease_api_spider.py
+--------------------------------------------------------------------------------
+Purpose: Non-Scrapy crawler that fetches COVID-19 case data per country from
+  the disease.sh REST API and inserts records directly into the outbreaks
+  collection (bypasses the NLP pipeline).
+Target Source: https://disease.sh/v3/covid-19/countries
+HTTP Library: requests (with 30s timeout)
+Data Mapping:
+  - disease: "COVID-19" (hardcoded)
+  - country: from API response
+  - lat/lng: from countryInfo object
+  - location: GeoJSON Point (for 2dsphere index)
+  - case_count: total cases from API
+  - source: "disease.sh"
+Error Handling: Prints errors, continues per-country
+
+--------------------------------------------------------------------------------
+4.8  backend/crawler/spiders/who_gho_spider.py  (156 lines)
+--------------------------------------------------------------------------------
+Purpose: Fetches real case-count data from the WHO Global Health Observatory
+  (GHO) API for 7 diseases, stores results in disease_stats collection for
+  later enrichment during pipeline processing.
+
+Target Source: https://ghoapi.azureedge.net/api/ (WHO GHO OData API)
+Diseases Mapped:
+  cholera, malaria, tuberculosis, measles, hiv/aids, hepatitis b, leprosy
+  (Note: "influenza" is defined in the mapping logic but NOT in
+  disease_mapping dict — the code has an "if target_disease == 'influenza'"
+  branch that would never execute because influenza is not a key)
+
+Indicator Resolution Strategy:
+  1. Fetches full indicator list from GHO API
+  2. For malaria: hardcoded to MALARIA_EST_CASES
+  3. For others: searches indicator names by keyword, filters out bad words
+     (deaths, mortality, coverage, etc.), prefers indicators with good words
+     (cases, incidence, infections, number)
+
+Data Fetching:
+  - For each indicator, fetches all data points
+  - Groups by country, keeps only most recent year per country
+  - Normalizes country names via _normalize_country() from processor.py
+  - Upserts to disease_stats collection keyed on (disease, country)
+
+Rate Limiting: None (but uses 30s timeout on all requests)
+Error Handling: try/except per disease, prints errors, continues
+
+--------------------------------------------------------------------------------
+4.9  backend/database/mongo_connection.py
+--------------------------------------------------------------------------------
+Purpose: Provides a singleton MongoDB connection via get_db(). Uses module-level
+  globals _client and _db to ensure only one MongoClient is created per process.
+Connection Config:
+  - serverSelectionTimeoutMS: 5000
+  - connectTimeoutMS: 10000
+  - socketTimeoutMS: 10000
+  - Pings admin db on first connect to verify connectivity
+Design Pattern: Singleton via module-level globals
+
+--------------------------------------------------------------------------------
+4.10  backend/database/init_db.py
+--------------------------------------------------------------------------------
+Purpose: Creates all required MongoDB collections and indexes.
+
+Collections Created:
+  - raw_articles
+  - processed_articles
+  - diseases
+  - outbreaks
+  - subscribers
+
+Indexes Created:
+  raw_articles:
+    - url (unique) — prevents duplicate article ingestion
+    - crawled_at
+  processed_articles:
+    - url (unique)
+    - diseases_found
+    - locations_found
+    - is_relevant
+  diseases:
+    - name (unique)
+  outbreaks:
+    - disease
+    - country
+    - date
+    - location (2dsphere) — enables geospatial queries
+  subscribers:
+    - email (unique)
+    - region
+
+Note: Additional collections created at runtime but not in init_db.py:
+  - disease_stats (created by WHO GHO spider)
+  - alerts_log (created by alerts.py)
+
+--------------------------------------------------------------------------------
+4.11  backend/database/seed_diseases.py
+--------------------------------------------------------------------------------
+Purpose: Seeds the diseases collection with 10 curated disease records
+  (dengue, cholera, malaria, tuberculosis, covid-19, influenza, hepatitis b,
+  typhoid, measles, monkeypox). Also includes 2 sample outbreaks (not used
+  by seed function).
+Fields Per Disease: name, symptoms (array), transmission, prevention, severity,
+  last_updated
+Idempotent: Only inserts if disease name not already present.
+
+--------------------------------------------------------------------------------
+4.12  backend/database/seed_outbreaks.py
+--------------------------------------------------------------------------------
+Purpose: Seeds sample outbreak data (6 records) for initial development/demo.
+  DESTRUCTIVE: Calls db.outbreaks.delete_many({}) before inserting.
+Records: Dengue/India, Cholera/Yemen, Malaria/Nigeria, Tuberculosis/South Africa,
+  Measles/Pakistan, Monkeypox/DR Congo
+
+--------------------------------------------------------------------------------
+4.13  backend/nlp/ner.py  (133 lines)
+--------------------------------------------------------------------------------
+Purpose: Extracts disease names and geographic locations from text using a
+  multi-method approach.
+
+NLP Model: spaCy en_core_web_sm (loaded once at module level)
+
+Disease Extraction Strategy (3 layers):
+  Layer 1 — PhraseMatcher:
+    - 37 disease keywords added as phrase patterns (attr=LOWER)
+    - Matches are normalized via DISEASE_MAP (e.g., "covid" → "covid-19",
+      "flu" → "influenza", "hiv" → "hiv/aids")
+  Layer 2 — Fallback Substring Scan:
+    - Iterates FALLBACK_KEYWORDS against text.lower() using Python "in" operator
+    - Catches hyphenated/compound forms that PhraseMatcher misses
+      (e.g., "leprosy-free" still matches "leprosy")
+    - Same normalization via DISEASE_MAP
+
+Location Extraction:
+  - Uses spaCy NER entities with label "GPE" (Geo-Political Entity)
+  - Normalizes via LOCATION_MAP (e.g., "U.S." → "United States")
+
+Output Format: {"diseases": list[str], "locations": list[str]}
+
+Note: This module (ner.py) is the one actually imported by processor.py.
+  entity_extractor.py is a separate, more sophisticated implementation that
+  is NOT currently used by the pipeline.
+
+--------------------------------------------------------------------------------
+4.14  backend/nlp/entity_extractor.py  (157 lines)
+--------------------------------------------------------------------------------
+Purpose: Advanced multi-layer disease and location extraction. Appears to be
+  an improved/alternative implementation of ner.py. NOT currently imported by
+  any other module in the pipeline.
+
+Extraction Layers:
+  Layer 1 — EntityRuler:
+    - Adds DISEASE label patterns to spaCy pipeline (before NER)
+    - Uses comprehensive DISEASE_ALIASES dict covering 17 diseases with
+      multiple aliases each (e.g., tuberculosis: tb, tubercular,
+      mycobacterium tuberculosis, consumption, phthisis, etc.)
+    - Returns most frequent canonical disease name (via Counter)
+  Layer 2 — (skipped in code, goes to Layer 3)
+  Layer 3 — Regex Fallback:
+    - 5 regex patterns for specific abbreviations (COVID-19, TB, HIV, HBV,
+      H1N1/H3N2/H5N1)
+  Layer 4 — Title Fallback:
+    - If article dict provided, re-runs Layer 1 + Layer 3 on title only
+    - Catches cases where body text is too generic but title is specific
+
+Output Format: {"diseases": list, "locations": list, "disease": str|None,
+  "extraction_method": str|None}
+
+IMPORTANT: This module is NOT wired into the pipeline. It exists in the
+  codebase but processor.py imports from nlp.ner, not nlp.entity_extractor.
+  UNCLEAR — needs author input: Was this intended as a replacement? Is there
+  a plan to switch?
+
+--------------------------------------------------------------------------------
+4.15  backend/nlp/relevance.py  (113 lines)
+--------------------------------------------------------------------------------
+Purpose: Determines whether a news article is relevant to disease-outbreak
+  surveillance. Provides a dual-strategy approach with graceful fallback.
+
+Strategy 1 — ML Model (when available):
+  - Loads classifier.pkl and vectorizer.pkl from nlp/models/ at import time
+  - TF-IDF transforms input text
+  - Logistic Regression predict_proba → class 1 probability = confidence
+  - Threshold: 0.5 (natural decision boundary)
+  - Returns {"is_relevant": bool, "confidence": float}
+
+Strategy 2 — Keyword Fallback (when model files absent):
+  - Checks text against 18 keywords (diseases, synonyms, symptoms/signals)
+  - is_relevant = True if ≥ 1 keyword matches
+  - confidence = min(keyword_count / 3, 1.0)
+
+Public API:
+  - is_relevant_article(text) → {"is_relevant": bool, "confidence": float}
+  - is_model_loaded() → bool
+
+Design Pattern: Strategy pattern with automatic selection at import time.
+
+--------------------------------------------------------------------------------
+4.16  backend/nlp/train_classifier.py  (181 lines)
+--------------------------------------------------------------------------------
+Purpose: Trains the TF-IDF + Logistic Regression classifier used by
+  relevance.py. Uses auto-labeling of raw_articles from MongoDB.
+
+Auto-Labeling Heuristic:
+  - Positive (1) if text contains ANY disease name (24 diseases) OR ANY
+    epidemiological signal word (14 words: outbreak, epidemic, cases, etc.)
+  - Uses OR logic (not AND) because small corpus (<300 articles) produced
+    too few positives with AND logic
+
+Training Pipeline:
+  1. Loads articles from raw_articles (title + description/content)
+  2. Auto-labels each combined text
+  3. TfidfVectorizer(ngram_range=(1,2), max_features=5000, stop_words="english")
+  4. train_test_split(test_size=0.2, stratify=labels, random_state=42)
+  5. LogisticRegression(class_weight="balanced", max_iter=1000)
+  6. Prints classification_report
+  7. Saves classifier.pkl and vectorizer.pkl via joblib
+
+Output: nlp/models/classifier.pkl (~40KB), nlp/models/vectorizer.pkl (~210KB)
+
+--------------------------------------------------------------------------------
+4.17  backend/nlp/alerts.py  (112 lines)
+--------------------------------------------------------------------------------
+Purpose: Checks for outbreaks and sends email alerts to subscribers whose
+  region matches an outbreak country.
+
+Flow:
+  1. Fetches ALL outbreaks (note: _get_recent_outbreaks ignores window_start
+     parameter — always returns all outbreaks, not just recent ones — this
+     appears to be a bug or unfinished implementation)
+  2. For each outbreak, finds subscribers matching the country/region
+  3. Checks alerts_log to prevent duplicate sends
+  4. Builds email via SendGrid Mail class
+  5. CURRENTLY SIMULATED: actual SendGrid .send() call is commented out;
+     prints "[ALERT] (SIMULATED)" instead
+  6. Logs sent alerts in alerts_log collection
+
+Email Configuration:
+  - From: alerts@mediscope.local (hardcoded)
+  - Subject: "New outbreak alert: {disease} in {country}"
+  - Body: Plain text with disease, country, date, case count, source URL
+
+--------------------------------------------------------------------------------
+4.18  backend/pipeline/processor.py  (618 lines)
+--------------------------------------------------------------------------------
+Purpose: Main article processing pipeline. This is the core module that
+  transforms raw crawled articles into structured outbreak records.
+
+Key Data Structures:
+  - GENERIC_DISEASE_TERMS: Set of terms to ignore as disease names (12 terms)
+  - COUNTRY_FIX: Dict mapping 36 city/state names to their parent country
+  - COUNTRY_ALIASES: Dict mapping 13 country name variants to canonical form
+  - COUNTRY_COORDS: Dict of 66 countries with (lat, lng) coordinates
+  - DISEASE_NAME_MAPPING: Dict of 8 synonyms → canonical disease names
+  - DISEASE_DISPLAY_NAMES: Dict of 28 diseases → display-case names
+  - VALID_DISEASES: Set of 12 diseases considered valid for outbreak records
+  - CASE_PATTERNS: 3 compiled regex patterns for extracting case counts from
+    text (handles "1,300 cases", "5k cases", "millions of deaths")
+
+Key Functions:
+  - extract_case_count(text): Regex-based numeric extraction, returns max
+    number found
+  - calculate_severity(case_count): Simple threshold (>8000=high, >3000=medium,
+    else low). NOTE: This is a DIFFERENT severity function from utils/severity.py
+    which uses a weighted score of case_count/5000 + occurrences*1.5
+  - _normalize_disease_name(disease): Cleans, filters generic terms, maps
+    synonyms, falls back to title case
+  - _pick_primary_disease(text, candidates, known_diseases): Multi-pass
+    matching: NER candidates → disease aliases → known disease names →
+    display name keys. Returns earliest match in text (by character index)
+  - _pick_primary_country(text, candidates): Multi-pass: NER locations →
+    known countries → city/state fix → common locations. Returns earliest match
+  - _normalize_country(raw): Maps raw location string to canonical country
+    name using COUNTRY_COORDS keys and COUNTRY_ALIASES
+
+process_articles() Main Loop:
+  For each article in raw_articles (ALL, not just unprocessed — no
+  {processed: False} filter):
+    1. Build analysis text from title + content
+    2. Extract entities (diseases, locations) via ner.py
+    3. Check relevance via relevance.py
+    4. Update raw_article with processed=True, is_relevant, etc.
+    5. If relevant:
+       a. Pick primary disease (multi-pass matching)
+       b. Validate against VALID_DISEASES; fallback to text detection
+       c. Pick primary country
+       d. Extract case count from text
+       e. If no case count: enrich from disease_stats via enricher.py
+       f. Calculate severity
+       g. Upsert to outbreaks (keyed on disease + country + date)
+    6. Print statistics summary
+
+IMPORTANT BUG/DESIGN ISSUE: The processor re-processes ALL articles every run
+  (no filter on processed=False). This means previously processed articles
+  are re-evaluated and either skip as duplicates or get updated in place.
+
+--------------------------------------------------------------------------------
+4.19  backend/pipeline/enricher.py  (33 lines)
+--------------------------------------------------------------------------------
+Purpose: Looks up case counts from the disease_stats collection (populated by
+  WHO GHO spider) to enrich outbreaks that lack extracted case counts.
+
+Strategy:
+  1. Try exact match: disease + country (case-insensitive regex on country)
+  2. Fallback: find highest case_count globally for that disease
+  3. Return int or None
+
+--------------------------------------------------------------------------------
+4.20  backend/pipeline/scheduler.py  (32 lines)
+--------------------------------------------------------------------------------
+Purpose: Sets up recurring jobs using the schedule library.
+Jobs:
+  - Every 6 hours: run_all_crawlers() + check_and_send_alerts()
+  - Every 24 hours: WHOGHOSpider.run()
+Implementation: Infinite loop with schedule.run_pending() + sleep(60)
+
+Note: The scheduler does NOT call process_articles(). Crawling and processing
+  are currently decoupled — processing must be run manually.
+  UNCLEAR — needs author input: Is this intentional? Should the scheduler
+  also trigger processing after crawling?
+
+--------------------------------------------------------------------------------
+4.21  backend/utils/severity.py  (13 lines)
+--------------------------------------------------------------------------------
+Purpose: Calculates outbreak severity using a weighted score combining
+  total case count and number of occurrences (distinct outbreak reports).
+Formula:
+  score = (total_cases / 5000) + (occurrences * 1.5)
+  if score < 5: "low"
+  elif score < 12: "medium"
+  else: "high"
+
+Note: This function is used by the API routes (routes.py) for dynamic severity
+  calculation per disease. A DIFFERENT calculate_severity() function exists in
+  pipeline/processor.py that only uses case_count (not occurrences) and has
+  different thresholds (>8000=high, >3000=medium). These two severity
+  calculations are inconsistent.
+
+--------------------------------------------------------------------------------
+4.22  backend/models/__init__.py
+--------------------------------------------------------------------------------
+Purpose: Empty placeholder. The models/ package contains only __init__.py.
+  No data models or ML model definitions are defined here.
+  UNCLEAR — needs author input: Was this intended for Pydantic/dataclass
+  models that were never implemented?
+
+--------------------------------------------------------------------------------
+4.23  backend/test_db.py
+--------------------------------------------------------------------------------
+Purpose: Quick manual database connectivity test. Inserts test documents into
+  raw_articles, verifies read, tests unique index behavior.
+  NOT a proper test suite — no assertions, no test framework.
+
+
+================================================================================
+4B. MODULE-BY-MODULE BREAKDOWN — FRONTEND
+================================================================================
+
+--------------------------------------------------------------------------------
+4B.1  frontend/src/main.jsx
+--------------------------------------------------------------------------------
+Purpose: React application entry point. Renders <App /> into #root with
+  React.StrictMode. Imports global CSS and Leaflet CSS.
+
+--------------------------------------------------------------------------------
+4B.2  frontend/src/App.jsx
+--------------------------------------------------------------------------------
+Purpose: Root component. Sets up client-side routing via BrowserRouter.
+Routes:
+  /          → Home
+  /map       → MapPage
+  /disease/* → DiseaseDetail (wildcard route for disease name in path)
+  /compare   → Compare
+  /search    → Search
+  /alerts    → Alerts
+All routes are nested under Layout (provides Navbar + Outlet).
+
+--------------------------------------------------------------------------------
+4B.3  frontend/src/components/Layout.jsx
+--------------------------------------------------------------------------------
+Purpose: Page shell component. Renders Navbar at top and <Outlet /> (child
+  route content) in a flex-grow main area. Background: bg-gray-50.
+
+--------------------------------------------------------------------------------
+4B.4  frontend/src/components/Navbar.jsx
+--------------------------------------------------------------------------------
+Purpose: Navigation bar with links to Home, Map, Compare, Search, Alerts.
+  Blue background (bg-blue-600), white text. Uses react-router-dom <Link>.
+
+--------------------------------------------------------------------------------
+4B.5  frontend/src/components/Loader.jsx
+--------------------------------------------------------------------------------
+Purpose: Reusable loading spinner. Tailwind animate-spin with blue border.
+
+--------------------------------------------------------------------------------
+4B.6  frontend/src/components/StatCard.jsx
+--------------------------------------------------------------------------------
+Purpose: Dashboard stat card displaying a title and numeric value. Used on
+  Home page for summary statistics.
+
+--------------------------------------------------------------------------------
+4B.7  frontend/src/components/OutbreakCard.jsx  (94 lines)
+--------------------------------------------------------------------------------
+Purpose: Card component displaying a single outbreak record with disease name,
+  country, case count, date, and severity badge. Handles "Unknown Disease"
+  by displaying as "Unidentified Disease" with disabled styling (cursor-
+  not-allowed, reduced opacity, no click navigation).
+
+Features:
+  - Severity color coding (high=red, medium=orange, low/default=green)
+  - Formatted case count (Intl.NumberFormat)
+  - Formatted date (en-GB, e.g., "21 Jun 2026")
+  - Clickable: navigates to /disease/{name} (except for unknown)
+
+Note: This component is defined but NOT currently imported by any page.
+  UNCLEAR — needs author input: Was it replaced by inline card rendering
+  in Home.jsx?
+
+--------------------------------------------------------------------------------
+4B.8  frontend/src/pages/Home.jsx  (159 lines)
+--------------------------------------------------------------------------------
+Purpose: Dashboard home page. Fetches /api/outbreaks/summary on mount and
+  displays:
+  1. Three StatCards: Diseases Summarized, Occurrences Logged, High Severity count
+  2. Critical Outbreaks section: up to 3 high-severity outbreaks in red-bordered
+     cards with "High Risk" badge
+  3. Recent Outbreaks: grid of all outbreak summary cards, each clickable to
+     navigate to /disease/{name}
+
+State Management: useState + useEffect (no global state library)
+API Consumed: GET /api/outbreaks/summary
+Error Handling: Displays error banner if API call fails
+
+--------------------------------------------------------------------------------
+4B.9  frontend/src/pages/Map.jsx  (370 lines)
+--------------------------------------------------------------------------------
+Purpose: Interactive outbreak map + disease trend chart page. The most complex
+  frontend component.
+
+Map Section:
+  - Leaflet MapContainer centered at [20, 0], zoom level 2
+  - OpenStreetMap tile layer
+  - CircleMarker for each outbreak, color-coded by severity
+  - Marker radius proportional to case count (capped 5-20px)
+  - Popup on click showing disease, country, cases, date, source
+  - Severity legend overlay (absolute positioned)
+
+Trend Chart Section:
+  - Dropdown to select disease (populated from /api/outbreaks via
+    fetchOutbreakDiseases helper)
+  - Line chart (Chart.js) showing case count over time for selected disease
+  - Fetches /api/outbreaks/trends?disease=X on selection change
+
+State Management: useState + useEffect
+APIs Consumed:
+  - GET /api/outbreaks/map
+  - GET /api/outbreaks (for disease list)
+  - GET /api/outbreaks/trends?disease=X
+
+Chart.js Registration: CategoryScale, LinearScale, PointElement, LineElement,
+  Title, Tooltip, Legend, Filler
+
+--------------------------------------------------------------------------------
+4B.10  frontend/src/pages/DiseaseDetail.jsx  (148 lines)
+--------------------------------------------------------------------------------
+Purpose: Detailed view of a single disease. Extracts disease name from URL
+  path (location.pathname.replace('/disease/', '')). Displays:
+  - Disease name with severity badge
+  - Last updated date
+  - Symptoms list
+  - Transmission info
+  - Prevention info
+
+API Consumed: GET /api/diseases/{name}
+Error Handling: Shows "Disease not found" with "Back to Home" button
+
+--------------------------------------------------------------------------------
+4B.11  frontend/src/pages/Compare.jsx  (328 lines)
+--------------------------------------------------------------------------------
+Purpose: Side-by-side comparison of two diseases. Two dropdown selectors
+  populated from /api/diseases. On selection, fetches /api/compare?d1=X&d2=Y.
+  Displays comparison table with fields: Severity, Symptoms, Transmission,
+  Prevention. Highlights differences (bg-red-50).
+
+Features:
+  - Pre-fills disease 1 from URL query param ?d1=X
+  - Prevents comparison of same disease
+  - Disease names in header link to /disease/{name}
+  - Symptoms rendered as pill badges
+
+APIs Consumed:
+  - GET /api/diseases (for dropdown population)
+  - GET /api/compare?d1=X&d2=Y
+
+State Management: useState + useEffect + useMemo
+
+--------------------------------------------------------------------------------
+4B.12  frontend/src/pages/Search.jsx  (132 lines)
+--------------------------------------------------------------------------------
+Purpose: Symptom-based disease search. User enters comma-separated symptoms,
+  results show matching diseases with severity badges and matched symptoms.
+
+API Consumed: GET /api/search?symptoms=fever,headache
+Features:
+  - Medical disclaimer (yellow banner)
+  - Shows first 3 symptoms per result, "+N more" for overflow
+  - Each result links to /disease/{name}
+
+State Management: useState (no useEffect — search triggered by form submit)
+
+--------------------------------------------------------------------------------
+4B.13  frontend/src/pages/Alerts.jsx  (226 lines)
+--------------------------------------------------------------------------------
+Purpose: Email alert subscription management. Users enter email + select region
+  from a hardcoded list of 8 countries. Subscriptions are persisted to
+  localStorage AND sent to backend API.
+
+Regions Available: India, USA, Pakistan, Nigeria, South Africa, United Kingdom,
+  Brazil, Yemen
+
+Subscription Flow:
+  1. Validates email (regex) and region
+  2. Checks for duplicate in localStorage
+  3. Saves to localStorage immediately (never lost even if API fails)
+  4. Attempts POST /api/alerts/subscribe
+  5. Shows success/warning based on API availability
+
+Features:
+  - Local subscription list with remove button
+  - Graceful degradation: works offline via localStorage
+  - "Max 100 alerts per day on free tier" note (appears to be UI-only text,
+    no actual rate limiting implemented)
+
+API Consumed: POST /api/alerts/subscribe
+  Request Body: {"email": str, "diseases": [region]}
+  Note: Frontend sends "diseases" key but backend expects "region" — there
+  is a mismatch. The backend reads payload.get("region"), not
+  payload.get("diseases"). This means the backend subscription will always
+  have an empty region field when created from the frontend.
+  THIS IS A BUG.
+
+--------------------------------------------------------------------------------
+4B.14  frontend/src/utils/api.js
+--------------------------------------------------------------------------------
+Purpose: Creates and exports a configured axios instance with:
+  - baseURL: "http://127.0.0.1:5000/api" (HARDCODED)
+  - Content-Type: application/json
+
+--------------------------------------------------------------------------------
+4B.15  frontend/src/services/api.js
+--------------------------------------------------------------------------------
+Purpose: API helper that wraps axios calls. Exports:
+  - fetchOutbreakDiseases(): Fetches /outbreaks, extracts unique non-null
+    disease names, returns sorted deduplicated array
+  - Default export: the api instance from utils/api.js
+
+--------------------------------------------------------------------------------
+4B.16  frontend/src/services/alertService.js
+--------------------------------------------------------------------------------
+Purpose: Thin wrapper: getAlerts() → api.get("/outbreaks")
+  Note: Currently unused by any component (Alerts.jsx calls api directly).
+
+--------------------------------------------------------------------------------
+4B.17  frontend/src/services/diseaseService.js
+--------------------------------------------------------------------------------
+Purpose: Thin wrapper: getDiseases() → api.get("/diseases")
+  Note: Currently unused by any component (pages call api directly).
+
+--------------------------------------------------------------------------------
+4B.18  frontend/src/styles/global.css
+--------------------------------------------------------------------------------
+Purpose: Tailwind CSS directives only (@tailwind base, components, utilities).
+  No custom CSS.
+
+--------------------------------------------------------------------------------
+4B.19  frontend Configuration Files
+--------------------------------------------------------------------------------
+vite.config.js: Minimal — just imports react plugin
+tailwind.config.js: Standard content paths, no theme customization
+postcss.config.js: tailwindcss + autoprefixer
+eslint.config.js: ESLint 9 flat config with react-hooks + react-refresh plugins
+index.html: Minimal HTML5 with favicon, viewport meta, title "Mediscope —
+  Disease Outbreak Tracker"
+
+
+================================================================================
+5. DATABASE SCHEMA
+================================================================================
+
+Database: MongoDB Atlas (database name: "mediscope")
+ORM: None (direct pymongo driver usage)
+
+COLLECTION: raw_articles
+─────────────────────────
+Field             Type        Description
+url               string      Article URL (UNIQUE INDEX)
+title             string      Article headline
+content           string      Article body/description
+source            string      "WHO" | "CDC"
+credibility       string      "verified" (always)
+crawled_at        datetime    UTC timestamp of crawl
+processed         boolean     Whether pipeline has processed this article
+is_relevant       boolean     Set by relevance classifier during processing
+diseases_found    array[str]  Disease names extracted by NER
+locations_found   array[str]  Location names extracted by NER
+confidence        float       Relevance classifier confidence score
+
+COLLECTION: processed_articles
+──────────────────────────────
+Indexes defined but collection appears to be created without explicit
+document structure — UNCLEAR if it's actively written to. The pipeline
+updates raw_articles in-place rather than creating separate processed
+documents.
+
+COLLECTION: diseases
+────────────────────
+Field             Type        Description
+name              string      Lowercase disease name (UNIQUE INDEX)
+symptoms          array[str]  List of symptom strings
+transmission      string      Transmission description
+prevention        string      Prevention description
+severity          string      "low" | "medium" | "high" (static from seed)
+last_updated      datetime    Timestamp of last seed/update
+description       string      (only on manually inserted records: HIV/AIDS, leprosy)
+created_at        datetime    (only on manually inserted records)
+
+COLLECTION: outbreaks
+─────────────────────
+Field                 Type        Description
+disease               string      Normalized disease name (INDEX)
+country               string      Country name (INDEX)
+region                string      Region/country (used by disease_api_spider)
+lat                   float       Latitude
+lng                   float       Longitude
+location              object      GeoJSON Point {type, coordinates} (2DSPHERE INDEX)
+date                  datetime    Outbreak date (INDEX)
+case_count            int         Number of cases
+case_count_estimated  boolean     True if case_count was not extracted from text
+case_count_source     string      "extracted" | "who_gho" | "unavailable"
+severity              string      "low" | "medium" | "high"
+source                string      "WHO" | "CDC" | "disease.sh"
+source_url            string      URL of source article/API
+
+COLLECTION: disease_stats
+─────────────────────────
+Field             Type        Description
+disease           string      Lowercase disease name
+country           string      Country name
+case_count        int         Number of cases (most recent year from GHO)
+year              int         Year of the data
+source            string      "WHO GHO"
+fetched_at        datetime    UTC timestamp of fetch
+(Upsert key: disease + country)
+
+COLLECTION: subscribers
+───────────────────────
+Field             Type        Description
+email             string      Subscriber email (UNIQUE INDEX)
+region            string      Region of interest (INDEX)
+subscribed_at     datetime    UTC timestamp
+
+COLLECTION: alerts_log
+──────────────────────
+Field             Type        Description
+email             string      Recipient email
+outbreak_id       ObjectId    Reference to outbreaks._id
+sent_at           datetime    UTC timestamp of send
+(Unique compound index: email + outbreak_id)
+
+
+================================================================================
+6. API REFERENCE
+================================================================================
+
+Base URL: http://127.0.0.1:5000/api
+Response Envelope: {"success": bool, "data": any, "message": str|null}
+Authentication: NONE
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/health
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Health check
+Response: {"success": true, "data": {"status": "ok"}}
+Status: 200
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/diseases
+────────────────────────────────────────────────────────────────────────────────
+Purpose: List all diseases with dynamically computed severity
+Query Params:
+  - severity (optional): Filter by severity level ("low"|"medium"|"high")
+Response Data: Array of disease objects:
+  {name, symptoms[], transmission, prevention, severity, last_updated}
+Severity Calculation: Aggregates outbreaks by disease → total_cases +
+  occurrences → utils/severity.calculate_severity()
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/diseases/<name>
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Get single disease by name (case-insensitive regex match)
+Response Data: Single disease object with dynamically computed severity
+Status: 404 if not found
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/outbreaks
+────────────────────────────────────────────────────────────────────────────────
+Purpose: List outbreaks with optional filtering
+Query Params:
+  - region (optional): Filter by region
+  - disease (optional): Filter by disease
+  - date_from (optional): ISO date string, inclusive
+  - date_to (optional): ISO date string, inclusive
+Response Data: Array of outbreak objects (limit 100)
+Note: Hard limit of 100 results, no pagination support
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/outbreaks/summary
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Aggregated outbreak statistics per disease
+Response Data: Array of:
+  {disease, total_cases, occurrences, severity}
+Sorted by total_cases descending
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/outbreaks/map
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Outbreak data formatted for map display (only records with valid
+  coordinates and non-generic disease names)
+Response Data: Array of:
+  {disease, country, lat, lng, case_count, severity, date, source}
+Severity: Dynamically computed per disease (same as /api/diseases)
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/outbreaks/trends
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Case count time series for a specific disease
+Query Params:
+  - disease (REQUIRED): Disease name (case-insensitive)
+Response Data: Array of {date: "YYYY-MM-DD", case_count: int}
+Sorted by date ascending
+Status: 400 if disease param missing
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/search
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Search diseases by symptoms
+Query Params:
+  - symptoms (required): Comma-separated symptom keywords
+Response Data: Array of disease objects whose symptoms array contains any of
+  the provided keywords (MongoDB $in operator)
+Note: This is a simple array-contains match, not fuzzy/semantic search
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/compare
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Side-by-side comparison of two diseases
+Query Params:
+  - d1 (REQUIRED): First disease name
+  - d2 (REQUIRED): Second disease name
+Response Data: {d1: diseaseObj, d2: diseaseObj}
+Status: 400 if params missing, 404 if either disease not found
+
+────────────────────────────────────────────────────────────────────────────────
+GET /api/export/csv
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Export outbreaks as CSV file download
+Query Params: Same filters as GET /api/outbreaks
+Response: text/csv with Content-Disposition: attachment; filename=outbreaks.csv
+Fields: disease, country, region, lat, lng, date, case_count, source, source_url
+
+────────────────────────────────────────────────────────────────────────────────
+POST /api/alerts/subscribe
+────────────────────────────────────────────────────────────────────────────────
+Purpose: Subscribe an email address for region-based outbreak alerts
+Request Body (JSON):
+  {email: str, region: str}
+Validation: Regex email validation
+Response: 201 on success, 400 on invalid email, 409 if already subscribed
+Note: No unsubscribe endpoint exists
+
+
+================================================================================
+7. DATA PIPELINE FLOW (Crawler → NLP → Storage → Serving)
+================================================================================
+
+PHASE 1: CRAWLING (crawler/__init__.py → run_all_crawlers())
+  1a. WHOHealthSpider crawls WHO RSS → raw_articles (source="WHO")
+  1b. CDCHealthSpider crawls CDC RSS → raw_articles (source="CDC")
+  1c. DiseaseAPISpider fetches disease.sh → outbreaks (direct, COVID-19 only)
+  
+PHASE 1B: GHO DATA FETCH (separate, runs every 24h)
+  WHOGHOSpider fetches WHO GHO API → disease_stats (7 diseases × many countries)
+
+PHASE 2: PROCESSING (pipeline/processor.py → process_articles())
+  For each document in raw_articles:
+  2a. Build analysis_text = title + " " + content
+  2b. NER Extraction (nlp/ner.py):
+      - spaCy PhraseMatcher → disease keywords
+      - Substring fallback scan → catches hyphenated forms
+      - spaCy NER (GPE label) → locations
+      - Normalization via DISEASE_MAP, LOCATION_MAP
+  2c. Relevance Classification (nlp/relevance.py):
+      - TF-IDF + LogReg model → predict_proba → confidence
+      - OR keyword fallback → match count → confidence
+  2d. Update raw_article: set processed=True, is_relevant, diseases_found,
+      locations_found, confidence
+  2e. If NOT relevant → skip
+  2f. Disease Resolution:
+      - _pick_primary_disease: multi-pass (NER → aliases → known → display names)
+      - Validate against VALID_DISEASES (12 diseases)
+      - Fallback: _detect_disease_from_text (direct text scan)
+      - Guard: if disease name is actually a country name → set to None
+  2g. Country Resolution:
+      - _pick_primary_country: multi-pass (NER → known → city fix → common)
+      - Guard: if country name is actually a disease name → set to None
+  2h. Case Count Extraction:
+      - Regex extraction from text (comma-separated numbers, "N cases" patterns)
+      - Returns max number found
+  2i. Case Count Enrichment (if no count extracted):
+      - enricher.py → disease_stats lookup (country-specific, then global max)
+      - Records source as "who_gho" or "unavailable"
+  2j. Severity Calculation:
+      - processor.calculate_severity(case_count) [>8000=high, >3000=medium]
+  2k. Upsert to outbreaks collection (key: disease + country + date)
+
+PHASE 3: ALERTS (nlp/alerts.py → check_and_send_alerts())
+  3a. Fetch all outbreaks (not just recent — see bug note above)
+  3b. For each outbreak: find subscribers matching country
+  3c. Check alerts_log for duplicates
+  3d. Send email (currently simulated) and log to alerts_log
+
+PHASE 4: SERVING (api/routes.py via Flask)
+  4a. Frontend calls REST endpoints
+  4b. Routes query MongoDB collections directly
+  4c. Severity is dynamically recomputed at API time using
+      utils/severity.calculate_severity (DIFFERENT formula from processor)
+  4d. Data serialized (ObjectId → str, datetime → ISO) and returned as JSON
+
+PHASE 5: DISPLAY (React frontend)
+  5a. Axios calls to Flask API
+  5b. Data rendered via React components (Map, Charts, Cards, Tables)
+
+
+================================================================================
+8. CONFIGURATION & ENVIRONMENT REQUIREMENTS
+================================================================================
+
+ENVIRONMENT VARIABLES (from .env):
+  - MONGODB_URI: MongoDB Atlas connection string (required)
+  - SENDGRID_API_KEY: SendGrid API key for email alerts (optional; set to
+    "skip_for_now" in current .env; alerts are simulated when absent/invalid)
+  - DATABASE_NAME: Present in .env but NOT read by config.py — config.py
+    hardcodes "mediscope"
+
+SYSTEM REQUIREMENTS:
+  - Python 3.13
+  - Node.js 18+
+  - MongoDB Atlas cluster (free tier sufficient)
+  - spaCy model: en_core_web_sm (must be downloaded: python -m spacy download
+    en_core_web_sm)
+
+HARDCODED CONFIGURATION:
+  - Flask port: 5000 (default)
+  - CORS origin: http://localhost:5173 (hardcoded in app.py)
+  - Frontend API base URL: http://127.0.0.1:5000/api (hardcoded in utils/api.js)
+  - Database name: "mediscope" (hardcoded in config.py)
+  - Email from address: alerts@mediscope.local (hardcoded in alerts.py)
+  - Scheduler intervals: 6 hours (crawl+alerts), 24 hours (GHO)
+  - Map center: [20, 0] zoom 2 (hardcoded in Map.jsx)
+  - Outbreak query limit: 100 (hardcoded in routes.py)
+  - Alert regions: 8 countries (hardcoded in Alerts.jsx)
+  - Relevance threshold: 0.5 confidence (hardcoded in relevance.py)
+  - Severity thresholds: 8000/3000 in processor.py, 5/12 weighted score in
+    utils/severity.py
+
+
+================================================================================
+9. KNOWN LIMITATIONS / GAPS
+================================================================================
+
+BUGS:
+  1. FRONTEND-BACKEND ALERT SUBSCRIPTION MISMATCH: Alerts.jsx sends
+     {"diseases": [region]} but routes.py reads payload.get("region"). The
+     backend will always store an empty string for the region field on
+     subscriptions created from the frontend.
+  2. ALERT WINDOW NOT IMPLEMENTED: alerts.py._get_recent_outbreaks() accepts
+     window_start parameter but ignores it — returns ALL outbreaks via
+     db["outbreaks"].find({}). This means every alert check re-processes
+     the entire outbreaks collection.
+  3. PROCESSOR RE-PROCESSES ALL ARTICLES: process_articles() does
+     db["raw_articles"].find({}) with no filter on processed=False. Every run
+     re-evaluates all articles, relying on upsert deduplication.
+  4. DATABASE_NAME ENV VAR IGNORED: .env contains DATABASE_NAME but config.py
+     hardcodes "mediscope" instead of reading from env.
+
+DUAL SEVERITY CALCULATIONS:
+  - pipeline/processor.py: calculate_severity(case_count) — simple threshold
+    on case_count only
+  - utils/severity.py: calculate_severity(total_cases, occurrences) — weighted
+    score combining cases and occurrence count
+  - API routes use utils/severity.py; processor uses its own. Severity values
+    stored in outbreaks may differ from those computed at API serving time.
+
+UNUSED CODE:
+  - entity_extractor.py: More sophisticated NER module exists but is not
+    imported by the pipeline (ner.py is used instead)
+  - OutbreakCard.jsx: Component defined but not imported by any page
+  - alertService.js: Service defined but not imported by Alerts.jsx
+  - diseaseService.js: Service defined but not imported by any page
+  - backend/models/: Package exists with empty __init__.py — no models defined
+
+MISSING TESTS:
+  - No test framework (pytest, unittest, Jest, etc.) is configured
+  - test_db.py is a manual connectivity script, not an automated test
+  - No unit tests for NER, relevance classifier, pipeline processing
+  - No API integration tests
+  - No frontend component tests
+  - No end-to-end tests
+
+MISSING FUNCTIONALITY:
+  - No authentication or authorization on API endpoints
+  - No pagination on any list endpoint (/api/outbreaks has hardcoded limit=100)
+  - No unsubscribe endpoint for email alerts
+  - No rate limiting on API endpoints
+  - No logging framework (uses print() throughout)
+  - No health monitoring or error tracking
+  - SendGrid email sending is commented out (simulated with print statements)
+  - WHO GHO spider does not support influenza (defined in code path but not in
+    disease_mapping dict)
+  - WHO GHO does not provide COVID-19 data (noted in README)
+
+HARDCODED VALUES:
+  - COUNTRY_COORDS: 66 countries with static lat/lng — countries not in this
+    dict are silently dropped during processing
+  - VALID_DISEASES: Only 12 diseases are accepted for outbreak records — the
+    NER can extract more diseases but they're filtered out
+  - REGIONS in Alerts.jsx: Only 8 countries available for subscription
+  - API base URL hardcoded to localhost (no env variable for production)
+  - Flask CORS origin hardcoded to localhost:5173
+
+NO BENCHMARK/EVALUATION DATA:
+  - No classifier accuracy metrics saved (classification_report is printed
+    during training but not persisted)
+  - No NER precision/recall evaluation
+  - No pipeline throughput benchmarks
+  - No F1 scores or confusion matrices stored
+
+NO DEPLOYMENT INFRASTRUCTURE:
+  - No Dockerfile or docker-compose.yml
+  - No CI/CD configuration
+  - No production WSGI server configuration (gunicorn, etc.)
+  - No environment-specific configuration (dev/staging/prod)
+  - No reverse proxy configuration (nginx, etc.)
+  - No SSL/TLS configuration
+
+DATA QUALITY ISSUES:
+  - Pipeline output shows many "Unknown Disease" extractions and articles
+    where disease=None
+  - Country normalization is static — new countries or variant spellings
+    are silently dropped
+  - Case counts from WHO GHO reflect most recent available year, not real-time
+  - Auto-labeling for classifier training uses loose OR logic — may introduce
+    false positives in training data
+
+SECURITY:
+  - .env file contains actual MongoDB credentials (committed to repo based on
+    the file being present; .gitignore may exclude it but it exists locally)
+  - No input sanitization beyond email regex validation
+  - MongoDB queries use regex with user input (potential ReDoS if names are
+    crafted, though re.escape is used in most places)
+  - No CSRF protection
+  - No rate limiting
+
+
+================================================================================
+10. OPEN QUESTIONS FOR THE AUTHOR
+================================================================================
+
+  1. entity_extractor.py vs ner.py: The entity_extractor.py module implements
+     a more sophisticated multi-layer extraction strategy (EntityRuler, regex,
+     title fallback, extraction_method tracking). Is it intended to replace
+     ner.py? Why is the pipeline still using the simpler ner.py?
+
+  2. Dual severity functions: pipeline/processor.py and utils/severity.py
+     implement different severity calculations. Which is authoritative? Should
+     the processor use the same weighted formula as the API routes?
+
+  3. Scheduler does not trigger processing: The scheduler runs crawlers and
+     alerts but does NOT call process_articles(). Is processing intended to
+     be run manually, or should it be automated after each crawl cycle?
+
+  4. processed_articles collection: Indexes are created for this collection
+     but the pipeline updates raw_articles in-place rather than writing to
+     processed_articles. Is this collection intended for future use?
+
+  5. backend/models/ package: Empty. Was this intended for Pydantic data models,
+     ORM-like schemas, or ML model definitions?
+
+  6. OutbreakCard component: Defined but not imported. Was it deprecated in
+     favor of inline card rendering in Home.jsx?
+
+  7. Alert subscription field mismatch: Frontend sends "diseases" but backend
+     reads "region". Is this a known bug or was the API contract changed
+     without updating the frontend?
+
+  8. Re-processing all articles: Is the lack of a processed=False filter in
+     process_articles() intentional (to allow re-evaluation with updated
+     models/data) or an oversight?
+
+  9. Classifier evaluation: Are there saved metrics from classifier training
+     runs? What precision/recall numbers have been observed? The README
+     mentions "modest" results with <100 articles — what's the current
+     training set size?
+
+ 10. COVID-19 data path: DiseaseAPISpider writes directly to outbreaks
+     (bypassing NLP pipeline). Is this intentional because COVID data from
+     disease.sh is already structured, or should it go through the pipeline?
+
+ 11. Production deployment: Is there a deployment target? Cloud provider?
+     How is the scheduler intended to run in production (background process,
+     cron job, container)?
+
+ 12. SENDGRID_API_KEY = "skip_for_now": Is email alert functionality
+     planned for implementation, or is it a proof-of-concept feature?
+
+
+================================================================================
+END OF KNOWLEDGE BASE
+================================================================================

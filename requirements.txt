@@ -1,0 +1,10 @@
+scrapy
+requests
+pymongo
+flask
+flask-cors
+python-dotenv
+spacy
+scikit-learn
+sendgrid
+schedule
